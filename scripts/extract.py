@@ -25,6 +25,7 @@ Outputs:
 Set BOOK_SKILL_WORKDIR to override the output directory.
 """
 
+import glob
 import html
 import html.parser
 import importlib.util
@@ -593,42 +594,98 @@ def extract_with_docling(pdf_path: str) -> str | None:
         return None
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: extract.py <path-to-document> [--mode technical|text] [--install-missing ask|yes|no]", file=sys.stderr)
-        print(f"Supported formats: {supported_formats_message()}", file=sys.stderr)
-        sys.exit(1)
-
-    input_path = sys.argv[1]
-    install_mode = normalize_install_mode(sys.argv)
-
-    # Parse --mode flag
+def parse_arguments(argv: list[str]) -> tuple[list[str], str, str]:
+    """Parse argv into (input_paths, extraction_mode, install_mode)."""
+    input_paths = []
     extraction_mode = "text"
-    if "--mode" in sys.argv:
-        idx = sys.argv.index("--mode")
-        if idx + 1 < len(sys.argv):
-            extraction_mode = sys.argv[idx + 1].lower()
+    
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--mode":
+            if i + 1 < len(args):
+                extraction_mode = args[i+1].lower()
+                i += 2
+            else:
+                i += 1
+        elif arg == "--install-missing":
+            if i + 1 < len(args) and not args[i+1].startswith("--"):
+                i += 2
+            else:
+                i += 1
+        elif arg == "--no-install-missing":
+            i += 1
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            input_paths.append(arg)
+            i += 1
+            
+    install_mode = normalize_install_mode(argv)
     if extraction_mode not in ("technical", "text"):
         extraction_mode = "text"
+        
+    return input_paths, extraction_mode, install_mode
 
-    if not os.path.exists(input_path):
-        print(f"ERROR: File not found: {input_path}", file=sys.stderr)
+
+def resolve_input_files(paths: list[str]) -> list[Path]:
+    """Resolve paths including files, directories, and glob patterns to Path objects."""
+    resolved = []
+    for path_str in paths:
+        # Check if it has glob wildcards
+        if any(char in path_str for char in ("*", "?", "[")):
+            glob_matches = glob.glob(path_str, recursive=True)
+            for match in glob_matches:
+                p = Path(match)
+                if p.is_file():
+                    resolved.append(p.resolve())
+        else:
+            p = Path(path_str)
+            if p.is_dir():
+                for root, _, files in os.walk(p):
+                    for file in files:
+                        file_path = Path(root) / file
+                        if file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                            resolved.append(file_path.resolve())
+            else:
+                # Keep even if it doesn't exist so the error check can report it
+                resolved.append(p.resolve())
+                
+    # Deduplicate while preserving order, then sort by file path for consistency
+    seen = set()
+    unique_paths = []
+    for path in resolved:
+        resolved_path = path.resolve() if path.exists() else path
+        if resolved_path not in seen:
+            seen.add(resolved_path)
+            unique_paths.append(resolved_path)
+            
+    unique_paths.sort(key=lambda x: str(x).lower())
+    return unique_paths
+
+
+def extract_single_file(input_path: Path, extraction_mode: str, install_mode: str) -> dict:
+    """Extract text and metadata from a single file path."""
+    input_str = str(input_path)
+    
+    if not input_path.exists():
+        print(f"ERROR: File not found: {input_str}", file=sys.stderr)
         sys.exit(1)
-
-    input_file = Path(input_path)
-    ext = input_file.suffix.lower()
+        
+    ext = input_path.suffix.lower()
     document_format = ext.lstrip(".")
-
-    # Sniff magic bytes as a fallback for files without useful extensions.
+    
+    # Sniff magic bytes if suffix is not supported
     if ext not in SUPPORTED_EXTENSIONS:
-        with open(input_path, "rb") as f:
+        with open(input_str, "rb") as f:
             header = f.read(8)
         if header[:4] == b"%PDF":
             ext = ".pdf"
             document_format = "pdf"
         elif header[:2] == b"PK":
             try:
-                with zipfile.ZipFile(input_path) as zf:
+                with zipfile.ZipFile(input_str) as zf:
                     names = set(zf.namelist())
                     if "mimetype" in names and zf.read("mimetype").startswith(b"application/epub"):
                         ext = ".epub"
@@ -638,13 +695,13 @@ def main():
                         document_format = "docx"
                     else:
                         print(
-                            f"ERROR: Unsupported ZIP-based format '{input_file.name}'. Supported: {supported_formats_message()}",
+                            f"ERROR: Unsupported ZIP-based format '{input_path.name}'. Supported: {supported_formats_message()}",
                             file=sys.stderr,
                         )
                         sys.exit(1)
             except (zipfile.BadZipFile, KeyError, OSError):
                 print(
-                    f"ERROR: Unsupported ZIP-based format '{input_file.name}'. Supported: {supported_formats_message()}",
+                    f"ERROR: Unsupported ZIP-based format '{input_path.name}'. Supported: {supported_formats_message()}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -654,10 +711,9 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            
     prepare_dependencies(ext, extraction_mode, install_mode)
-
+    
     if ext in CALIBRE_EBOOK_EXTENSIONS and not shutil.which("ebook-convert"):
         print(
             "MOBI/AZW/AZW3 extraction requires Calibre's ebook-convert command. "
@@ -665,43 +721,48 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
-
+        
+    text = ""
+    method = ""
+    pages = 0
+    pages_label = "sections"
+    
     if ext == ".epub":
-        print(f"Extracting EPUB: {input_path}")
-        text, method = extract_epub(input_path)
-        pages = count_epub_chapters(input_path)
+        print(f"Extracting EPUB: {input_str}")
+        text, method = extract_epub(input_str)
+        pages = count_epub_chapters(input_str)
         pages_label = "spine_items"
     elif ext == ".pdf":
-        print(f"Extracting PDF: {input_path}")
+        print(f"Extracting PDF: {input_str}")
         if extraction_mode == "technical":
             print("Mode: technical — using Docling (layout-aware)...", end=" ", flush=True)
-            text = extract_with_docling(input_path)
+            text = extract_with_docling(input_str)
             if text:
                 method = "docling"
                 print("OK")
             else:
                 print("not available, falling back to pdftotext")
                 extraction_mode = "text"
-
-        if extraction_mode == "text":
+                
+        if extraction_mode == "text" or not text:
             print("Mode: text — using pdftotext...")
             print("Trying pdftotext...", end=" ", flush=True)
-            text = extract_with_pdftotext(input_path)
-
+            text = extract_with_pdftotext(input_str)
+            
             if text:
                 method = "pdftotext"
                 print("OK")
             else:
                 print("not available")
                 print("Trying PyPDF2...", end=" ", flush=True)
-                text = extract_with_pypdf2(input_path)
+                text = extract_with_pypdf2(input_str)
                 if text:
                     method = "PyPDF2"
                     print("OK")
                 else:
                     print("not available")
                     print("Trying pdfminer.six...", end=" ", flush=True)
-                    text = extract_with_pdfminer(input_path)
+                    text = extract_with_pdfminer(input_str)
                     if text:
                         method = "pdfminer"
                         print("OK")
@@ -716,12 +777,12 @@ def main():
                             file=sys.stderr,
                         )
                         sys.exit(1)
-
-        pages = count_pages(input_path)
+                        
+        pages = count_pages(input_str)
         pages_label = "pages"
     elif ext in TEXT_EXTENSIONS:
-        print(f"Extracting text document: {input_path}")
-        text = read_text_file(input_path)
+        print(f"Extracting text document: {input_str}")
+        text = read_text_file(input_str)
         if text is None or not text.strip():
             print("ERROR: Could not read text document", file=sys.stderr)
             sys.exit(1)
@@ -729,8 +790,8 @@ def main():
         pages = 0
         pages_label = "sections"
     elif ext in HTML_EXTENSIONS:
-        print(f"Extracting HTML: {input_path}")
-        text = extract_html_file(input_path)
+        print(f"Extracting HTML: {input_str}")
+        text = extract_html_file(input_str)
         if text is None or not text.strip():
             print("ERROR: Could not extract text from HTML", file=sys.stderr)
             sys.exit(1)
@@ -738,18 +799,18 @@ def main():
         pages = 0
         pages_label = "sections"
     elif ext == ".docx":
-        print(f"Extracting DOCX: {input_path}")
-        text, method = extract_docx(input_path)
+        print(f"Extracting DOCX: {input_str}")
+        text, method = extract_docx(input_str)
         pages = 0
         pages_label = "sections"
     elif ext == ".rtf":
-        print(f"Extracting RTF: {input_path}")
-        text, method = extract_rtf(input_path)
+        print(f"Extracting RTF: {input_str}")
+        text, method = extract_rtf(input_str)
         pages = 0
         pages_label = "sections"
     elif ext in CALIBRE_EBOOK_EXTENSIONS:
-        print(f"Extracting ebook with Calibre: {input_path}")
-        text = extract_with_ebook_convert(input_path)
+        print(f"Extracting ebook with Calibre: {input_str}")
+        text = extract_with_ebook_convert(input_str)
         if text is None or not text.strip():
             print(
                 f"ERROR: Could not extract text from {ext}. Install Calibre and ensure ebook-convert is on PATH.",
@@ -759,53 +820,121 @@ def main():
         method = "ebook-convert"
         pages = 0
         pages_label = "sections"
-    else:
-        print(
-            f"ERROR: Unsupported format '{ext}'. Supported: {supported_formats_message()}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Write full text
-    OUTPUT_TEXT.write_text(text, encoding="utf-8")
-
+        
     tokens = estimate_tokens(text)
     structure = detect_structure(text)
-    file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-
-    metadata = {
-        "source_file": str(Path(input_path).resolve()),
-        "filename": Path(input_path).name,
+    file_size_mb = os.path.getsize(input_str) / (1024 * 1024)
+    
+    return {
+        "source_file": str(input_path.resolve()),
+        "filename": input_path.name,
         "format": document_format,
         "extraction_method": method,
-        "extraction_mode": extraction_mode,
         "file_size_mb": round(file_size_mb, 2),
         pages_label: pages,
+        "pages_label": pages_label,
+        "pages": pages,
         "chars": len(text),
         "words": len(text.split()),
         "estimated_tokens": tokens,
-        "estimated_tokens_human": f"~{tokens // 1000}K",
-        "output_text": str(OUTPUT_TEXT),
+        "text": text,
         **structure,
     }
 
-    OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
-    page_label = {
-        "spine_items": "Spine items",
-        "pages": "Pages",
-        "sections": "Sections",
-    }.get(pages_label, pages_label.replace("_", " ").title())
-    page_line = f"   {page_label}: {pages}"
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: extract.py <path-to-document-folder-or-glob>... [--mode technical|text] [--install-missing ask|yes|no]", file=sys.stderr)
+        print(f"Supported formats: {supported_formats_message()}", file=sys.stderr)
+        sys.exit(1)
+        
+    raw_input_paths, extraction_mode, install_mode = parse_arguments(sys.argv)
+    
+    if not raw_input_paths:
+        print("ERROR: No input document, folder, or glob pattern specified.", file=sys.stderr)
+        sys.exit(1)
+        
+    input_files = resolve_input_files(raw_input_paths)
+    
+    if not input_files:
+        print(f"ERROR: No supported files found matching: {', '.join(raw_input_paths)}", file=sys.stderr)
+        sys.exit(1)
+        
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    extracted_sources = []
+    combined_texts = []
+    
+    for file_path in input_files:
+        res = extract_single_file(file_path, extraction_mode, install_mode)
+        extracted_sources.append(res)
+        
+        # Format the text with a clear boundary
+        separator = f"\n\n{'=' * 80}\nSOURCE: {res['filename']} (Path: {res['source_file']})\n{'=' * 80}\n\n"
+        combined_texts.append(separator + res["text"])
+        
+    # Combine texts
+    consolidated_text = "".join(combined_texts).strip()
+    
+    # Write combined text
+    OUTPUT_TEXT.write_text(consolidated_text, encoding="utf-8")
+    
+    # Consolidate metadata
+    total_file_size_mb = sum(src["file_size_mb"] for src in extracted_sources)
+    total_pages = sum(src["pages"] for src in extracted_sources)
+    total_chars = len(consolidated_text)
+    total_words = len(consolidated_text.split())
+    total_tokens = estimate_tokens(consolidated_text)
+    
+    # Detect structure on consolidated text
+    consolidated_structure = detect_structure(consolidated_text)
+    
+    metadata = {
+        "source_file": "Consolidated from multiple sources" if len(extracted_sources) > 1 else extracted_sources[0]["source_file"],
+        "filename": "multi-source" if len(extracted_sources) > 1 else extracted_sources[0]["filename"],
+        "format": "mixed" if len(extracted_sources) > 1 else extracted_sources[0]["format"],
+        "extraction_method": "multi-method" if len(extracted_sources) > 1 else extracted_sources[0]["extraction_method"],
+        "extraction_mode": extraction_mode,
+        "file_size_mb": round(total_file_size_mb, 2),
+        "pages": total_pages,
+        "chars": total_chars,
+        "words": total_words,
+        "estimated_tokens": total_tokens,
+        "estimated_tokens_human": f"~{total_tokens // 1000}K",
+        "output_text": str(OUTPUT_TEXT),
+        "total_sources": len(extracted_sources),
+        "sources": [
+            {
+                "source_file": src["source_file"],
+                "filename": src["filename"],
+                "format": src["format"],
+                "extraction_method": src["extraction_method"],
+                "file_size_mb": src["file_size_mb"],
+                "pages": src["pages"],
+                "pages_label": src["pages_label"],
+                "chars": src["chars"],
+                "words": src["words"],
+                "estimated_tokens": src["estimated_tokens"],
+                "chapters_detected": src["chapters_detected"],
+                "has_toc": src["has_toc"]
+            }
+            for src in extracted_sources
+        ],
+        **consolidated_structure,
+    }
+    
+    OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+    
+    page_line = f"   Total Pages: {total_pages}"
     print("\nExtraction complete:")
-    print(f"   Format  : {document_format.upper()}")
-    print(f"   Method  : {method}")
+    print(f"   Sources : {len(extracted_sources)} processed")
+    print(f"   Size    : {total_file_size_mb:.2f} MB")
     print(page_line)
-    print(f"   Words   : {len(text.split()):,}")
-    print(f"   Tokens  : ~{tokens // 1000}K")
-    print(f"   Chapters: {structure['chapters_detected']} detected")
-    print(f"   ToC     : {'yes' if structure['has_toc'] else 'not detected'}")
-    if not structure["has_toc"]:
+    print(f"   Words   : {total_words:,}")
+    print(f"   Tokens  : ~{total_tokens // 1000}K")
+    print(f"   Chapters: {consolidated_structure['chapters_detected']} detected overall")
+    print(f"   ToC     : {'yes' if consolidated_structure['has_toc'] else 'not detected'}")
+    if not consolidated_structure["has_toc"]:
         print(
             "   WARN    : No table of contents detected — chapter mapping in Step 3 "
             "will rely on heading scan only, which may miss or duplicate sections."
